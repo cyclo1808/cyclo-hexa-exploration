@@ -382,6 +382,8 @@ class rest_api_handler(object):
 # NOTE: As of 2015-08-17, the Echo appears to have a hard-coded limit of
 # 16 switches it can control. Only the first 16 elements of the FAUXMOS
 # list will be used.
+# 
+# question if these following devices need to be editted to allow control with nodeMCU device.. DMS
 
 FAUXMOS = [
     ['office lights', rest_api_handler('http://192.168.5.4/ha-api?cmd=on&a=office', 'http://192.168.5.4/ha-api?cmd=off&a=office')],
