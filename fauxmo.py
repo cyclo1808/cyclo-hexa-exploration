@@ -25,6 +25,7 @@ THE SOFTWARE.
 """
 
 # For a complete discussion, see http://www.makermusings.com
+# TODO(semartin): investigate time.sleep usage in here...
 
 import email.utils
 import requests
@@ -35,33 +36,38 @@ import sys
 import time
 import urllib
 import uuid
-
-
+import logging
 
 # This XML is the minimum needed to define one of our virtual switches
 # to the Amazon Echo
 
-SETUP_XML = """<?xml version="1.0"?>
-<root>
-  <device>
-    <deviceType>urn:MakerMusings:device:controllee:1</deviceType>
-    <friendlyName>%(device_name)s</friendlyName>
-    <manufacturer>Belkin International Inc.</manufacturer>
-    <modelName>Emulated Socket</modelName>
-    <modelNumber>3.1415</modelNumber>
-    <UDN>uuid:Socket-1_0-%(device_serial)s</UDN>
-  </device>
-</root>
-"""
+SETUP_XML ="""<?xml version=1.0?>
+            <root>
+             <device>
+                <deviceType>urn:Belkin:device:controllee:1</deviceType>
+                <friendlyName>%(device_name)s</friendlyName>
+                <manufacturer>Belkin International Inc.</manufacturer>
+                <modelName>Socket</modelName>
+                <modelNumber>3.1415</modelNumber>
+                <modelDescription>Belkin Plugin Socket 1.0</modelDescription>\r\n
+                <UDN>uuid:Socket-1_0-%(device_serial)s</UDN>
+                <serialNumber>221517K0101769</serialNumber>
+                <binaryState>0</binaryState>
+                <serviceList>
+                  <service>
+                      <serviceType>urn:Belkin:service:basicevent:1</serviceType>
+                      <serviceId>urn:Belkin:serviceId:basicevent1</serviceId>
+                      <controlURL>/upnp/control/basicevent1</controlURL>
+                      <eventSubURL>/upnp/event/basicevent1</eventSubURL>
+                      <SCPDURL>/eventservice.xml</SCPDURL>
+                  </service>
+              </serviceList> 
+              </device>
+            </root>"""
 
-
-DEBUG = False
 
 def dbg(msg):
-    global DEBUG
-    if DEBUG:
-        print msg
-        sys.stdout.flush()
+    logging.debug(msg)
 
 
 # A simple utility class to wait for incoming data to be
@@ -69,40 +75,30 @@ def dbg(msg):
 
 class poller:
     def __init__(self):
-        if 'poll' in dir(select):
-            self.use_poll = True
-            self.poller = select.poll()
-        else:
-            self.use_poll = False
+        self.poller = select.poll()
         self.targets = {}
 
     def add(self, target, fileno = None):
         if not fileno:
             fileno = target.fileno()
-        if self.use_poll:
-            self.poller.register(fileno, select.POLLIN)
+        self.poller.register(fileno, select.POLLIN)
         self.targets[fileno] = target
 
     def remove(self, target, fileno = None):
         if not fileno:
             fileno = target.fileno()
-        if self.use_poll:
-            self.poller.unregister(fileno)
+        self.poller.unregister(fileno)
         del(self.targets[fileno])
 
     def poll(self, timeout = 0):
-        if self.use_poll:
-            ready = self.poller.poll(timeout)
-        else:
-            ready = []
-            if len(self.targets) > 0:
-                (rlist, wlist, xlist) = select.select(self.targets.keys(), [], [], timeout)
-                ready = [(x, None) for x in rlist]
+        ready = self.poller.poll(timeout)
+        num = len(ready)
         for one_ready in ready:
             target = self.targets.get(one_ready[0], None)
             if target:
                 target.do_read(one_ready[0])
- 
+        return num
+
 
 # Base class for a generic UPnP device. This is far from complete
 # but it supports either specified or automatic IP address and port
@@ -123,7 +119,7 @@ class upnp_device(object):
             del(temp_socket)
             dbg("got local address of %s" % upnp_device.this_host_ip)
         return upnp_device.this_host_ip
-        
+
 
     def __init__(self, listener, poller, port, root_url, server_version, persistent_uuid, other_headers = None, ip_address = None):
         self.listener = listener
@@ -141,6 +137,7 @@ class upnp_device(object):
             self.ip_address = upnp_device.local_ip_address()
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.socket.bind((self.ip_address, self.port))
         self.socket.listen(5)
         if self.port == 0:
@@ -156,21 +153,21 @@ class upnp_device(object):
         if fileno == self.socket.fileno():
             (client_socket, client_address) = self.socket.accept()
             self.poller.add(self, client_socket.fileno())
-            self.client_sockets[client_socket.fileno()] = client_socket
+            self.client_sockets[client_socket.fileno()] = (client_socket, client_address)
         else:
-            data, sender = self.client_sockets[fileno].recvfrom(4096)
+            data, sender = self.client_sockets[fileno][0].recvfrom(4096)
             if not data:
                 self.poller.remove(self, fileno)
                 del(self.client_sockets[fileno])
             else:
-                self.handle_request(data, sender, self.client_sockets[fileno])
+                self.handle_request(data, sender, self.client_sockets[fileno][0], self.client_sockets[fileno][1])
 
-    def handle_request(self, data, sender, socket):
+    def handle_request(self, data, sender, socket, client_address):
         pass
 
     def get_name(self):
         return "unknown"
-        
+
     def respond_to_search(self, destination, search_target):
         dbg("Responding to search for %s" % self.get_name())
         date_str = email.utils.formatdate(timeval=None, localtime=False, usegmt=True)
@@ -190,8 +187,8 @@ class upnp_device(object):
                 message += "%s\r\n" % header
         message += "\r\n"
         temp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        temp_socket.sendto(message, destination)
- 
+        temp_socket.sendto(bytes(message, 'UTF-8'), destination)
+        #print("Responding to search-->" + message )    
 
 # This subclass does the bulk of the work to mimic a WeMo switch on the network.
 
@@ -203,6 +200,7 @@ class fauxmo(upnp_device):
     def __init__(self, name, listener, poller, ip_address, port, action_handler = None):
         self.serial = self.make_uuid(name)
         self.name = name
+        self.switchStatus=0
         self.ip_address = ip_address
         persistent_uuid = "Socket-1_0-" + self.serial
         other_headers = ['X-User-Agent: redsonic']
@@ -216,7 +214,13 @@ class fauxmo(upnp_device):
     def get_name(self):
         return self.name
 
-    def handle_request(self, data, sender, socket):
+    def handle_request(self, data, sender, socket, client_address):
+        print("##################################   handle_reques #######################")
+        print(data)
+        print("##################################   handle_reques #######################")
+        data = data.decode('utf-8')
+        success = False
+        
         if data.find('GET /setup.xml HTTP/1.1') == 0:
             dbg("Responding to setup.xml for %s" % self.name)
             xml = SETUP_XML % {'device_name' : self.name, 'device_serial' : self.serial}
@@ -231,24 +235,33 @@ class fauxmo(upnp_device):
                        "CONNECTION: close\r\n"
                        "\r\n"
                        "%s" % (len(xml), date_str, xml))
-            socket.send(message)
+            socket.send(bytes(message, 'UTF-8'))
+            #print("responsed to setup-->" + message)
+        
         elif data.find('SOAPACTION: "urn:Belkin:service:basicevent:1#SetBinaryState"') != -1:
-            success = False
-            if data.find('<BinaryState>1</BinaryState>') != -1:
-                # on
-                dbg("Responding to ON for %s" % self.name)
-                success = self.action_handler.on()
-            elif data.find('<BinaryState>0</BinaryState>') != -1:
-                # off
-                dbg("Responding to OFF for %s" % self.name)
-                success = self.action_handler.off()
-            else:
-                dbg("Unknown Binary State request:")
-                dbg(data)
+        #elif data.find('urn:Belkin:service:basicevent:1') != -1:
+        #elif data.find("SetBinaryState") != -1:
+            
+            if data.find('SetBinaryState') != -1:
+                if data.find('<BinaryState>1</BinaryState>') != -1:
+                    # on
+                    dbg("Responding to ON for %s" % self.name)
+                    success = self.action_handler.on(client_address[0], self.name)
+                    self.switchStatus=1
+                elif data.find('<BinaryState>0</BinaryState>') != -1:
+                    # off
+                    dbg("Responding to OFF for %s" % self.name)
+                    success = self.action_handler.off(client_address[0], self.name)
+                    self.switchStatus=0
+                else:
+                    dbg("Unknown Binary State request:")
+                    dbg(data)
+                                
             if success:
                 # The echo is happy with the 200 status code and doesn't
                 # appear to care about the SOAP response body
-                soap = ""
+                #dbg("Unknown Binary State request:")
+                soap = "" 
                 date_str = email.utils.formatdate(timeval=None, localtime=False, usegmt=True)
                 message = ("HTTP/1.1 200 OK\r\n"
                            "CONTENT-LENGTH: %d\r\n"
@@ -260,7 +273,37 @@ class fauxmo(upnp_device):
                            "CONNECTION: close\r\n"
                            "\r\n"
                            "%s" % (len(soap), date_str, soap))
-                socket.send(message)
+                socket.send(bytes(message, 'UTF-8'))
+                
+        elif data.find('GetBinaryState'):
+            #if data.find('<BinaryState>1</BinaryState>') != -1:
+            #    switch_sate="1"
+            #else:
+            #    switch_sate="0"
+            soap = """<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+                <s:Body>
+                    <u:GetBinaryStateResponse
+                    xmlns:u="urn:Belkin:service:basicevent:1">
+                    <BinaryState>"""+ str(self.switchStatus) +"""</BinaryState>
+                    </u:GetBinaryStateResponse>
+                </s:Body></s:Envelope>""" 
+            
+            
+            date_str = email.utils.formatdate(timeval=None, localtime=False, usegmt=True)
+            message = ("HTTP/1.1 200 OK\r\n"
+                       "CONTENT-LENGTH: %d\r\n"
+                       "CONTENT-TYPE: text/xml charset=\"utf-8\"\r\n"
+                       "DATE: %s\r\n"
+                       "EXT:\r\n"
+                       "SERVER: Unspecified, UPnP/1.0, Unspecified\r\n"
+                       "X-User-Agent: redsonic\r\n"
+                       "CONNECTION: close\r\n"
+                       "\r\n"
+                       "%s" % (len(soap), date_str, soap))
+            socket.send(bytes(message, 'UTF-8'))
+            print("##################################   response #######################")
+            print(data)
+
         else:
             dbg(data)
 
@@ -300,18 +343,18 @@ class upnp_broadcast_responder(object):
 
             try:
                 self.ssock.bind(('',self.port))
-            except Exception, e:
-                dbg("WARNING: Failed to bind %s:%d: %s" , (self.ip,self.port,e))
+            except Exception:
+                dbg("WARNING: Failed to bind %s:%d: %s" , (self.ip,self.port))
                 ok = False
 
             try:
                 self.ssock.setsockopt(socket.IPPROTO_IP,socket.IP_ADD_MEMBERSHIP,self.mreq)
-            except Exception, e:
-                dbg('WARNING: Failed to join multicast group:',e)
+            except Exception:
+                dbg('WARNING: Failed to join multicast group:')
                 ok = False
 
-        except Exception, e:
-            dbg("Failed to initialize UPnP sockets:",e)
+        except Exception:
+            dbg("Failed to initialize UPnP sockets:")
             return False
         if ok:
             dbg("Listening for UPnP broadcasts")
@@ -321,10 +364,12 @@ class upnp_broadcast_responder(object):
 
     def do_read(self, fileno):
         data, sender = self.recvfrom(1024)
+        data = data.decode('utf-8')
         if data:
-            if data.find('M-SEARCH') == 0 and data.find('urn:Belkin:device:**') != -1:
+            #if data.find('M-SEARCH') == 0 and data.find('urn:Belkin:device:**') != -1:
+            if data.find('M-SEARCH') >= 0 and data.find('urn:Belkin:device:**') >0 or data.find('n:Belkin:device:**') >0 or data.find('upnp:rootdevice') >0:
                 for device in self.devices:
-                    time.sleep(0.1)
+                    time.sleep(0.5)
                     device.respond_to_search(sender, 'urn:Belkin:device:**')
             else:
                 pass
@@ -343,8 +388,8 @@ class upnp_broadcast_responder(object):
                 return self.ssock.recvfrom(size)
             else:
                 return False, False
-        except Exception, e:
-            dbg(e)
+        except Exception:
+            print('error')
             return False, False
 
     def add_device(self, device):
@@ -359,6 +404,19 @@ class upnp_broadcast_responder(object):
 # This example class takes two full URLs that should be requested when an on
 # and off command are invoked respectively. It ignores any return data.
 
+class dummy_handler(object):
+    def __init__(self, name):
+        self.name = name
+
+    def on(self):
+        print(self.name, "ON")
+        return True
+
+    def off(self):
+        print(self.name, "OFF")
+        return True
+
+
 class rest_api_handler(object):
     def __init__(self, on_cmd, off_cmd):
         self.on_cmd = on_cmd
@@ -372,54 +430,38 @@ class rest_api_handler(object):
         r = requests.get(self.off_cmd)
         return r.status_code == 200
 
+if __name__ == "__main__":
+    FAUXMOS = [
+        ['office lights', dummy_handler("officelight")],
+        ['kitchen lights', dummy_handler("kitchenlight")],
+    ]
 
-# Each entry is a list with the following elements:
-#
-# name of the virtual switch
-# object with 'on' and 'off' methods
-# port # (optional; may be omitted)
+    if len(sys.argv) > 1 and sys.argv[1] == '-d':
+        DEBUG = True
 
-# NOTE: As of 2015-08-17, the Echo appears to have a hard-coded limit of
-# 16 switches it can control. Only the first 16 elements of the FAUXMOS
-# list will be used.
-# 
-# question if these following devices need to be editted to allow control with nodeMCU device.. DMS
+    # Set up our singleton for polling the sockets for data ready
+    p = poller()
 
-FAUXMOS = [
-    ['office lights', rest_api_handler('http://192.168.5.4/ha-api?cmd=on&a=office', 'http://192.168.5.4/ha-api?cmd=off&a=office')],
-    ['kitchen lights', rest_api_handler('http://192.168.5.4/ha-api?cmd=on&a=kitchen', 'http://192.168.5.4/ha-api?cmd=off&a=kitchen')],
-]
+    # Set up our singleton listener for UPnP broadcasts
+    u = upnp_broadcast_responder()
+    u.init_socket()
 
+    # Add the UPnP broadcast listener to the poller so we can respond
+    # when a broadcast is received.
+    p.add(u)
 
-if len(sys.argv) > 1 and sys.argv[1] == '-d':
-    DEBUG = True
+    # Create our FauxMo virtual switch devices
+    for one_faux in FAUXMOS:
+        switch = fauxmo(one_faux[0], u, p, None, 0, action_handler = one_faux[1])
 
-# Set up our singleton for polling the sockets for data ready
-p = poller()
+    dbg("Entering main loop\n")
 
-# Set up our singleton listener for UPnP broadcasts
-u = upnp_broadcast_responder()
-u.init_socket()
-
-# Add the UPnP broadcast listener to the poller so we can respond
-# when a broadcast is received.
-p.add(u)
-
-# Create our FauxMo virtual switch devices
-for one_faux in FAUXMOS:
-    if len(one_faux) == 2:
-        # a fixed port wasn't specified, use a dynamic one
-        one_faux.append(0)
-    switch = fauxmo(one_faux[0], u, p, None, one_faux[2], action_handler = one_faux[1])
-
-dbg("Entering main loop\n")
-
-while True:
-    try:
-        # Allow time for a ctrl-c to stop the process
-        p.poll(100)
-        time.sleep(0.1)
-    except Exception, e:
-        dbg(e)
-        break
+    while True:
+        try:
+            # Allow time for a ctrl-c to stop the process
+            p.poll(100)
+            time.sleep(0.1)
+        except Exception:
+            print('error1')
+            break
 
